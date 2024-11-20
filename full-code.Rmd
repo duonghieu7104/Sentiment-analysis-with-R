@@ -1,0 +1,1023 @@
+---
+title: "Sentiment-analysis-with-R"
+author: "hieuduong"
+date: "2024-11-20"
+output: html_document
+---
+
+# Crawl data từ Reddit và lưu vào file .csv
+
+Dữ liệu sẽ được thu từ các mạng xã hội có chủ đề Review, Nhận xét, Đánh giá để phù hợp với mục đích phân loại và nhắm đến đối tượng phù hợp với người dùng.
+
+```{r}
+install.packages("RedditExtractoR") 
+install.packages("dplyr")
+```
+
+```{r}
+library(RedditExtractoR) 
+library(dplyr)
+```
+
+```{r}
+
+crawl_reddit_comments <- function(
+    keyword, 
+    num_threads = 10,  
+    min_comments = 0,     
+    date_from = NULL,         
+    date_to = NULL,         
+    sort_by = "top",    
+    output_file = "reddit_comments.csv"
+) {
+  cat("Finding threads with keyword:", keyword, "\n")
+  threads <- find_thread_urls(
+    keywords = keyword,
+    sort_by = sort_by
+  )
+  
+  if (!is.null(date_from)) {
+    threads <- threads[threads$date_utc >= date_from, ]
+  }
+  if (!is.null(date_to)) {
+    threads <- threads[threads$date_utc <= date_to, ]
+  }
+  
+  if (nrow(threads) == 0) {
+    stop("No threads found with the given criteria")
+  }
+  
+  if (min_comments > 0) {
+    threads <- threads[threads$comments >= min_comments, ]
+  }
+  
+  threads <- threads[1:min(num_threads, nrow(threads)), ]
+  
+  cat("Found", nrow(threads), "threads matching criteria\n")
+  
+  all_comments <- data.frame()
+  
+  for (i in 1:nrow(threads)) {
+    cat(sprintf("Processing thread %d of %d...\n", i, nrow(threads)))
+    tryCatch({
+      content <- get_thread_content(threads$url[i])
+      if (!is.null(content$comments) && nrow(content$comments) > 0) {
+        comments <- content$comments
+        comments$thread_title <- content$threads$title[1]
+        all_comments <- rbind(all_comments, comments)
+      }
+    }, error = function(e) {
+      cat("Error processing thread:", threads$url[i], "\n")
+    })
+    
+    Sys.sleep(2)
+  }
+  
+  if (nrow(all_comments) == 0) {
+    stop("No comments found in the processed threads")
+  }
+  
+  # Select and reorder columns
+  final_comments <- all_comments[, c(
+    "thread_title",
+    "comment",    
+    "author",   
+    "date",       
+    "score",    
+    "url",      
+    "comment_id"
+  )]
+  
+  cat("Saving", nrow(final_comments), "comments to:", output_file, "\n")
+  write.csv(final_comments, output_file, row.names = FALSE, fileEncoding = "UTF-8")
+  
+  cat("Done!\n")
+  return(final_comments)
+}
+```
+
+
+
+```{r}
+crawl_reddit_comments(
+  keyword = "game",
+  num_threads = 1,
+   min_comments = 10,
+   date_from = "2024-01-01",
+   date_to = "2024-11-16",
+   sort_by = "top",
+   output_file = "comments.csv"
+ )
+```
+
+
+# Dán nhãn data bằng cách call API Gemini
+
+Sẽ dán nhãn theo quy tắc sau:
+•	Sadness (0): Nếu văn bản thể hiện sự buồn bã.
+•	Joy (1): Nếu văn bản thể hiện sự vui mừng.
+•	Love (2): Nếu văn bản thể hiện tình yêu thương.
+•	Anger (3): Nếu văn bản thể hiện sự tức giận.
+•	Fear (4): Nếu văn bản thể hiện sự sợ hãi.
+•	Surprise (5): Nếu văn bản thể hiện sự ngạc nhiên.
+
+Dùng Gemini để phân loại và dán nhãn
+Gemini là mô hình ngôn ngữ lớn được phát triển bởi Google, có khả năng xử lý và phân tích văn bản tiếng Việt với độ chính xác cao. API của Gemini cung cấp khả năng phân tích cảm xúc (Sentiment Analysis) thông qua việc xử lý ngôn ngữ tự nhiên.
+
+
+```{r}
+library(httr)
+library(jsonlite)
+```
+
+
+```{r}
+classify_emotion <- function(api_key, input_text) {
+  url <- "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent"
+  
+  prompt <- sprintf("Given a sentence, classify its emotional tone into one of the following six emotions: sadness (0), joy (1), love (2), anger (3), fear (4), or surprise (5). Return only the corresponding ID of the detected emotion.
+  Examples:
+  Input: I can\'t believe this happened, I am so frustrated!
+  Output: 3
+  Input: I am so proud of you. I love you so much.
+  Output: 2
+  Input: This is amazing news! I am overjoyed!
+  Output: 1
+  Input: I am scared of what might happen next.
+  Output: 4
+  Task: Classify the emotion of the following sentence and return only the ID:
+  %s", input_text)
+  
+  body <- list(
+    contents = list(
+      list(
+        parts = list(
+          list(text = prompt)
+        )
+      )
+    )
+  )
+  
+  response <- POST(
+    url = paste0(url, "?key=", api_key),
+    body = toJSON(body, auto_unbox = TRUE),
+    add_headers("Content-Type" = "application/json"),
+    encode = "json"
+  )
+  
+raw_content <- rawToChar(response$content)
+
+cat("1. Raw Response:", raw_content, "\n\n")
+
+tryCatch({
+  content <- fromJSON(raw_content)
+  cat("2. Parsed content structure:\n")
+  str(content)
+  cat("\n")
+  
+  candidates <- content$candidates
+  cat("3. Candidates structure:\n")
+  str(candidates)
+  cat("\n")
+  
+  if (!is.null(candidates) && length(candidates) > 0) {
+    response_text <- candidates$content$parts[[1]]$text
+    cat("4. Raw text value:", response_text, "\n")
+    
+    cleaned_text <- trimws(response_text)
+    cat("5. Cleaned text value:", cleaned_text, "\n")
+    
+    emotion_id <- as.numeric(cleaned_text)
+    cat("6. Final numeric value:", emotion_id, "\n")
+    
+    if (!is.na(emotion_id)) {
+      return(emotion_id)
+    } else {
+      cat("Error: Không thể chuyển đổi thành số.\n")
+      return(NULL)
+    }
+  } else {
+    cat("Error: Không tìm thấy candidates.\n")
+    return(NULL)
+  }
+}, error = function(e) {
+  cat("Error processing response:", e$message, "\n")
+  return(NULL)
+  })
+}
+```
+
+
+```{r}
+api_key <- "YOUR_API_KEY"
+
+input_data <- read_csv("~/comments.csv")
+
+total_rows <- nrow(input_data)
+cat("Processing", total_rows, "rows\n")
+
+input_data$label <- sapply(seq_len(nrow(input_data)), function(i) {
+  if (i %% 10 == 0) {
+    cat(sprintf("Processing row %d of %d (%.1f%%)\n", 
+                i, total_rows, i/total_rows*100))
+  }
+  
+  result <- classify_emotion(api_key, input_data$text[i])
+  
+  Sys.sleep(1)
+  
+  return(result)
+})
+
+write_csv(input_data, "output.csv")
+cat("\nProcessing completed. Results saved to output.csv\n")
+
+cat("\nEmotion Distribution:\n")
+table(input_data$label)
+```
+
+# Tiền xử lí dữ liệu
+
+1. Chuyển đổi kí tự hoa thành thường
+Trong xử lý ngôn ngữ tự nhiên, việc chuyển đổi chữ hoa thành chữ thường là việc cần thiết. Việc này nhằm mục đích là đảm bảo tính thống nhất và tránh trường hợp trùng chữ do viết hoa.
+ 
+ Ví dụ:
+ Chưa xử lý: “ Đẹp wa OK”
+ Đã xử lý: “đẹp wa ok”
+ 
+2. Loại bỏ các dấu câu
+Các ký tự đặc biệt không có vai trò quá quan trọng trong quá trình phân tích. Vì thế nên loại bỏ chúng để giảm kích thước tập dữ liệu. Ví dụ: Chưa xử lý: “tuyệt vời!!!” Đã xử lý: “tuyệt vời”
+
+3. Loại bỏ các stop word
+Loại bỏ các từ không ảnh hướng đến cảm xúc trong câu, và những từ xuất hiện quá nhiều lần trong tập dữ liệu.
+
+
+
+```{r}
+library(tidyverse)
+library(tidytext)
+library(tm)
+library(SnowballC)
+library(dplyr)
+library(stringr)
+library(text2vec)
+library(nnet)
+library(caret)
+library(FSelector)
+library(textTinyR)
+```
+
+
+```{r}
+data <- read_csv("~/raw_data.csv")
+```
+
+```{r}
+custom_stop_words <- c(
+    "a", "an", "the", "am", "is", "are", "was", "were", "be", "being", "been",
+    "i", "im", "me", "my", "mine", "myself",
+    "you", "your", "yours", "yourself",
+    "he", "him", "his", "himself",
+    "she", "her", "hers", "herself",
+    "it", "its", "itself",
+    "we", "us", "our", "ours", "ourselves",
+    "they", "them", "their", "theirs", "themselves",
+    "do", "does", "did",
+    "have", "has", "had",
+    "will", "would",
+    "can", "could",
+    "shall", "should", "feel", "ive",
+    "may", "might",
+    "must",
+    "in", "on", "at", "to",
+    "of", "from", "with",
+    "by", "for", "about",
+    "under", "over", "between",
+    "through", "during", "within",
+    "without", "throughout", "into",
+    "onto", "upon",
+    "and", "but", "or",
+    "nor", "yet", "so",
+    "because", "although",
+    "unless", "whereas",
+    "while", "if",
+    "just", "now", "then",
+    "here", "there", "where",
+    "how", "why", "when",
+    "again", "often",
+    "sometimes", "usually",
+    "this", "that", "these", "those",
+    "what", "which", "who", "whom",
+    "whose", "where",
+    "why", "how", "all", "any",
+    "both", "each", "few", "more",
+    "most", "other", "some", "such",
+    "own", "same", "than",
+    "too", "up", "down", "feel"
+)
+
+clean_text <- data %>%
+  mutate(doc_id = row_number()) %>%
+  mutate(text = str_to_lower(text)) %>%
+  unnest_tokens(word, text) %>%
+  anti_join(stop_words) %>%
+  filter(!word %in% custom_stop_words) %>%
+  filter(!str_detect(word, "[:punct:]")) %>%
+  mutate(word = wordStem(word, language = "en")) %>%
+  group_by(doc_id, label) %>%
+  summarise(text = paste(word, collapse = " "), .groups = "drop")
+
+```
+
+
+```{r}
+clean_text <- clean_text %>%
+  arrange(doc_id) %>%
+  select(-doc_id)
+```
+
+```{r}
+write_csv(clean_text, "~/processed_text.csv")
+
+```
+
+
+# Trực quan hóa dữ liệu
+
+```{r}
+
+#install.packages("tm")
+#install.packages("SnowballC")
+#install.packages("wordcloud")
+#install.packages("RColorBrewer")
+```
+
+```{r}
+library(tm)
+library(SnowballC)
+library(wordcloud)
+library(RColorBrewer)
+
+```
+
+
+```{r}
+# Bước 1: Đọc file CSV
+dataset <- read.csv("processed_data.csv", stringsAsFactors = FALSE)
+
+
+# Load the data as a corpus
+docs <- VCorpus(VectorSource(dataset$text))
+#To replace special characters
+toSpace <- content_transformer(function (x , pattern ) gsub(pattern, " ", x))
+docs <- tm_map(docs, toSpace, "/")
+docs <- tm_map(docs, toSpace, "@")
+docs <- tm_map(docs, toSpace, "\\|")
+#convert to lower case
+docs <- tm_map(docs,content_transformer(tolower))
+# Remove numbers
+docs <- tm_map(docs, removeNumbers)
+# Remove english common stopwords
+docs <- tm_map(docs, removeWords, stopwords("english"))
+# Remove your own stop word
+# specify your stopwords as a character vector
+#docs <- tm_map(docs, removeWords, c("flight","unit","usairway","americanair","southwestair","jetblu","get","can","virginamerica","united","delta")) 
+# Remove punctuations
+docs <- tm_map(docs, removePunctuation)
+# Eliminate extra white spaces
+docs <- tm_map(docs, stripWhitespace)
+# Text stemming
+docs <- tm_map(docs, stemDocument)
+
+#Text to Matrix
+tdm <- TermDocumentMatrix(docs)
+m <- as.matrix(tdm)
+v <- sort(rowSums(m),decreasing=TRUE)
+d <- data.frame(word = names(v),freq=v)
+head(d, 10)
+
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+# Chọn top 15 từ có tần suất cao nhất
+top_words <- d %>% 
+  arrange(desc(freq)) %>% 
+  slice_head(n = 15)
+
+# Vẽ biểu đồ thanh ngang với ggplot2
+ggplot(top_words, aes(x = reorder(word, freq), y = freq)) +
+  geom_bar(stat = "identity", fill = "skyblue", color = "black") +
+  coord_flip() +  # Để thanh nằm ngang
+  theme_minimal() +
+  labs(
+    title = "Top 15 từ xuất hiện nhiều nhất",
+    x = "Tần suất",
+    y = "Từ"
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.text.y = element_text(size = 12)
+  )
+
+```
+
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+# Bước 1: Kiểm tra và đếm tần suất của mỗi label trong dataset
+if ("label" %in% colnames(dataset)) {
+  
+  # Đếm số lần xuất hiện của mỗi label và sắp xếp theo số lượng giảm dần
+  label_counts <- dataset %>%
+    count(label) %>%
+    arrange(desc(n))
+  
+  # Bước 2: Vẽ biểu đồ cột (Bar Chart) và đường (Line Chart)
+  ggplot(label_counts, aes(x = reorder(label, n), y = n)) +
+    
+    # Biểu đồ cột (Bar Chart) - thể hiện số lượng của mỗi label
+    geom_bar(stat = "identity", fill = "skyblue", color = "black", alpha = 0.7) +
+    
+    # Biểu đồ đường (Line Chart) - thể hiện xu hướng của số lượng
+    geom_line(aes(group = 1), color = "red", linewidth = 1.2) +  # Đổi 'size' thành 'linewidth' cho độ dày đường
+    geom_point(color = "darkred", size = 3) +  # Thêm các điểm đánh dấu trên đường
+    
+    # Tùy chỉnh giao diện biểu đồ
+    theme_minimal() +
+    
+    # Chú thích cho biểu đồ
+    labs(
+      title = "Tần suất và số lượng của các Labels",  # Tiêu đề
+      x = "Labels",  # Chú thích trục X
+      y = "Số lượng"  # Chú thích trục Y
+    ) +
+    
+    # Tùy chỉnh giao diện văn bản và trục
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),  # Quay các nhãn trục X để dễ đọc hơn
+      plot.title = element_text(hjust = 0.5, face = "bold", size = 14)  # Tiêu đề in đậm và căn giữa
+    )
+  
+} else {
+  print("Cột 'label' không tồn tại trong dataset")
+}
+
+```
+
+
+# TF-IDF
+
+TF-IDF (Term Frequency-Inverse Document Frequency) là một phương pháp biểu diễn văn bản thành vector số học dựa trên tần suất xuất hiện của từ và mức độ quan trọng của từ đó trong tập văn bản. 
+
+```{r}
+data <- read_csv("~/processed_text.csv")
+str(data)
+sum(is.na(data$text))
+```
+
+
+```{r}
+prep_fun <- tolower
+tok_fun <- word_tokenizer
+```
+
+```{r}
+it <- itoken(data$text, preprocessor = prep_fun, tokenizer = tok_fun, progressbar = FALSE)
+```
+
+```{r}
+vocab <- create_vocabulary(it, stopwords = stopwords("en"))
+```
+
+```{r}
+vocab <- prune_vocabulary(vocab, term_count_min = 3, doc_proportion_max = 0.95)
+
+saveRDS(vocab, "vocabulary.rds")
+```
+
+```{r}
+vocab <- readRDS("vocabulary.rds")
+
+vectorizer <- vocab_vectorizer(vocab)
+dtm <- create_dtm(it, vectorizer)
+```
+
+```{r}
+tfidf <- TfIdf$new()
+dtm_tfidf <- tfidf$fit_transform(dtm)
+```
+
+```{r}
+dtm_tfidf_df <- as.data.frame(as.matrix(dtm_tfidf))
+```
+
+
+```{r}
+input_data <- dtm_tfidf_df
+output_data <- data$label
+```
+
+
+```{r}
+dtm_tfidf_selected <- cbind(input_data, label = output_data)
+```
+
+```{r}
+write.csv(dtm_tfidf_selected, "~/dtm_tfidf_selected.csv", row.names = FALSE)
+```
+
+
+# Embedding
+
+Word Embedding là phương pháp biểu diễn từ thành các vector số học mật độ (dense vector) trong không gian nhiều chiều, trong đó các từ có ý nghĩa tương tự nhau sẽ có vị trí gần nhau trong không gian vector. Điều này khác biệt với phương pháp TF-IDF tạo ra các vector thưa (sparse vector).
+
+```{r}
+model_path = '~/googlenewsvectorsnegative300/GoogleNews-vectors-negative300.
+```
+
+
+```{r}
+data <- read.csv("~/processed_data.csv")
+```
+
+```{r}
+get_sentence_embedding <- function(sentence) {
+  if (is.character(sentence)) {
+    # Tách câu thành các từ
+    words <- unlist(strsplit(sentence, " "))
+    
+    # Lấy embedding cho mỗi từ
+    word_vectors <- list()
+    for (word in words) {
+      if (word %in% model$vocabulary) {
+        word_vectors[[length(word_vectors) + 1]] <- model[[word]]
+      }
+    }
+    
+    # Tính vector trung bình, hoặc trả về NA nếu không tìm thấy từ nào
+    if (length(word_vectors) > 0) {
+      return(colMeans(do.call(rbind, word_vectors)))
+    } else {
+      return(NA)
+    }
+  } else {
+    return(NA)
+  }
+}
+
+```
+
+
+# Train random forest
+
+```{r}
+install.packages("ranger")
+```
+
+```{r}
+library(ranger)
+library(tidyverse)
+library(tidytext)
+library(tm)
+library(SnowballC)
+library(dplyr)
+library(stringr)
+library(text2vec)
+library(nnet)
+library(caret)
+library(readr)
+```
+
+```{r}
+tfidf_df <- read.csv("~/dtm_tfidf.csv")
+```
+
+```{r}
+set.seed(123)
+
+trainIndex <- createDataPartition(tfidf_df$label, p = 0.9, list = FALSE, times = 1)
+train_data <- tfidf_df[trainIndex, ]
+test_data <- tfidf_df[-trainIndex, ]
+
+write.csv(train_data, "~/train_data.csv", row.names = FALSE)
+write.csv(test_data, "~/test_data.csv", row.names = FALSE)
+```
+
+
+```{r}
+data_train <- read.csv("/kaggle/working/train_data.csv")
+data_train$label <- as.factor(data_train$label)
+head(data_train)
+
+
+model_rf <- ranger(
+  label ~ ., 
+  data = data_train, 
+  num.trees = 500,
+  probability = TRUE,
+  importance = 'impurity'
+)
+
+
+print(model_rf)
+saveRDS(model_rf, "sentiment_model.rds")
+```
+
+# Train XgBoost
+
+```{r}
+install.packages("xgboost")
+```
+
+```{r}
+library(xgboost)
+library(tidyverse)
+library(tidytext)
+library(tm)
+library(SnowballC)
+library(dplyr)
+library(stringr)
+library(text2vec)
+library(nnet)
+library(caret)
+library(readr)
+```
+
+```{r}
+tfidf_df <- read.csv("/kaggle/input/tfidf-df-emotion-data/dtm_tfidf_02.csv")
+```
+
+```{r}
+set.seed(123)
+
+trainIndex <- createDataPartition(tfidf_df$label, p = 0.9, list = FALSE, times = 1)
+train_data <- tfidf_df[trainIndex, ]
+test_data <- tfidf_df[-trainIndex, ]
+
+write.csv(train_data, "/kaggle/working/train_data.csv", row.names = FALSE)
+write.csv(test_data, "/kaggle/working/test_data.csv", row.names = FALSE)
+```
+
+```{r}
+data_train <- read.csv("/kaggle/working/train_data.csv")
+```
+
+
+```{r}
+x_train <- as.matrix(data_train[, -which(names(data_train) == "label")])
+y_train <- as.numeric(as.factor(data_train$label)) - 1
+
+```
+
+```{r}
+model_xgboost <- xgboost(
+  data = x_train,           
+  label = y_train,         
+  nrounds = 100,          
+  objective = "multi:softprob", 
+  num_class = length(unique(y_train)),
+  eval_metric = "mlogloss", 
+  verbose = 1       
+)
+print(model_xgboost)
+xgb.save(model_xgboost, "sentiment_model.xgb")
+```
+
+
+# Train Neural network
+
+```{r}
+install.packages("keras")
+install.packages("tensorflow")
+install.packages("caret")
+```
+
+```{r}
+library(keras)
+library(tidyverse)
+library(caret)
+```
+
+```{r}
+data <- read.csv("~/data_with_embeddings.csv")
+```
+
+```{r}
+process_embedding <- function(embedding_str) {
+  tryCatch({
+    nums <- str_extract_all(embedding_str, "-?\\d+\\.\\d+e?-?\\d*")[[1]]
+    if(length(nums) == 300) {
+      return(as.numeric(nums))
+    } else {
+      return(NULL)
+    }
+  }, error = function(e) {
+    return(NULL)
+  })
+}
+
+embeddings_list <- lapply(data$embedding, process_embedding)
+
+valid_indices <- which(!sapply(embeddings_list, is.null))
+print(paste("Number of valid embeddings:", length(valid_indices)))
+
+embeddings_matrix <- do.call(rbind, embeddings_list[valid_indices])
+labels <- to_categorical(data$label[valid_indices], num_classes = 6)
+
+# In thông tin sau khi lọc
+print(paste("Final embeddings matrix dimension:", paste(dim(embeddings_matrix), collapse = " x ")))
+print(paste("Final labels dimension:", paste(dim(labels), collapse = " x ")))
+```
+
+
+```{r}
+set.seed(123)
+train_indices <- createDataPartition(y = valid_indices, p = 0.9, list = FALSE)
+
+X_train <- embeddings_matrix[train_indices,]
+X_test <- embeddings_matrix[-train_indices,]
+y_train <- labels[train_indices,]
+y_test <- labels[-train_indices,]
+
+```
+
+```{r}
+X_train_df <- as.data.frame(X_train)
+X_test_df <- as.data.frame(X_test)
+
+X_train_df$label <- apply(y_train, 1, function(x) which(x == 1) - 1)
+X_test_df$label <- apply(y_test, 1, function(x) which(x == 1) - 1)
+
+# Save as CSV files
+write.csv(X_train_df, "train_data.csv", row.names = FALSE)
+write.csv(X_test_df, "test_data.csv", row.names = FALSE)
+```
+
+
+```{r}
+train_data <- read.csv("train_data.csv")
+test_data <- read.csv("test_data.csv")
+```
+
+```{r}
+X_train <- as.matrix(train_data[, -ncol(train_data)])
+y_train <- to_categorical(train_data$label, num_classes = 6)
+
+X_test <- as.matrix(test_data[, -ncol(test_data)])
+y_test <- to_categorical(test_data$label, num_classes = 6)
+```
+
+```{r}
+model <- keras_model_sequential() %>%
+  layer_dense(units = 256, activation = "relu", input_shape = c(300)) %>%
+  layer_dropout(rate = 0.2) %>%
+  layer_dense(units = 128, activation = "relu") %>%
+  layer_dropout(rate = 0.2) %>%
+  layer_dense(units = 64, activation = "relu") %>%
+  layer_dropout(rate = 0.1) %>%
+  layer_dense(units = 6, activation = "softmax")
+
+# Compile
+model %>% compile(
+  loss = "categorical_crossentropy",
+  optimizer = optimizer_adam(learning_rate = 0.001),
+  metrics = c("accuracy")
+)
+
+# Early Stopping
+early_stopping <- callback_early_stopping(
+  monitor = "val_loss", 
+  patience = 15,
+  restore_best_weights = TRUE
+)
+
+# Training
+history <- model %>% fit(
+  X_train, y_train,
+  epochs = 250,
+  batch_size = 64,
+  validation_split = 0.2,
+  callbacks = list(early_stopping)
+)
+
+# Evaluate
+results <- model %>% evaluate(X_test, y_test)
+print(results)
+# Save model
+save_model_hdf5(model, "sentiment_model.h5")
+```
+
+#Test Random Forest
+
+
+```{r}
+test_data <- read.csv("dtm_tfidf_02.csv")
+```
+
+```{r}
+model_rf <- readRDS("sentiment_model1.rds")
+```
+
+```{r}
+# Dự đoán trên tập kiểm tra
+predictions <- predict(model_rf, data = test_data)
+
+# Lấy nhãn dự đoán (label dự đoán)
+predicted_labels <- predictions$predictions
+if ("matrix" %in% class(predicted_labels)) {
+  predicted_labels <- apply(predicted_labels, 1, which.max) - 1
+}
+
+# Chuyển nhãn thật về dạng factor để so sánh
+actual_labels <- test_data$label
+
+# Đánh giá độ chính xác
+accuracy <- mean(predicted_labels == actual_labels)
+cat("Độ chính xác của mô hình:", accuracy, "\n")
+
+# Sử dụng confusion matrix để đánh giá chi tiết
+conf_matrix <- caret::confusionMatrix(as.factor(predicted_labels), as.factor(actual_labels))
+print(conf_matrix)
+
+# Tính các chỉ số precision, recall, F1-score (nếu cần)
+precision <- conf_matrix$byClass["Precision"]
+recall <- conf_matrix$byClass["Recall"]
+f1_score <- conf_matrix$byClass["F1"]
+cat("Precision:", precision, "\n")
+cat("Recall:", recall, "\n")
+cat("F1-score:", f1_score, "\n")
+```
+
+#Test Neural network
+
+```{r}
+# Cài đặt và tải các thư viện cần thiết
+install.packages("keras")
+install.packages("tensorflow")
+install.packages("caret")
+install.packages("tidyverse")
+```
+
+```{r}
+library(keras)
+library(tidyverse)
+library(caret)
+
+```
+
+
+```{r}
+# Đọc file CSV
+data <- read.csv("data_with_embeddings.csv")
+```
+
+
+```{r}
+# Hàm xử lý chuỗi embedding thành ma trận số
+process_embedding <- function(embedding_str) {
+  tryCatch({
+    nums <- str_extract_all(embedding_str, "-?\\d+\\.\\d+e?-?\\d*")[[1]]
+    if(length(nums) == 300) {  # Kiểm tra chiều dài embedding là 300
+      return(as.numeric(nums))
+    } else {
+      return(NULL)
+    }
+  }, error = function(e) {
+    return(NULL)
+  })
+}
+
+# Chuyển đổi các embedding thành ma trận
+embeddings_list <- lapply(data$embedding, process_embedding)
+
+# Lọc ra các dòng có embedding hợp lệ
+valid_indices <- which(!sapply(embeddings_list, is.null))
+print(paste("Number of valid embeddings:", length(valid_indices)))
+
+# Tạo dataset mới chỉ với các dòng hợp lệ
+embeddings_matrix <- do.call(rbind, embeddings_list[valid_indices])
+labels <- to_categorical(data$label[valid_indices], num_classes = 6)
+
+# Chia dữ liệu thành tập train và test
+set.seed(123)
+train_indices <- createDataPartition(y = valid_indices, p = 0.9, list = FALSE)
+
+# Tạo training và test sets
+X_train <- embeddings_matrix[train_indices, ]
+X_test <- embeddings_matrix[-train_indices, ]
+y_train <- labels[train_indices, ]
+y_test <- labels[-train_indices, ]
+```
+
+```{r}
+# Load mô hình đã lưu
+model <- load_model_hdf5("sentiment_model.h5")
+
+# Dự đoán trên tập kiểm tra
+predictions <- model %>% predict(X_test)
+
+# Chuyển đổi dự đoán từ xác suất sang nhãn class
+predicted_classes <- apply(predictions, 1, function(x) which.max(x) - 1)
+
+# Chuyển đổi nhãn thực tế thành chỉ số class
+true_classes <- apply(y_test, 1, function(x) which.max(x) - 1)
+
+# Tính toán độ chính xác
+accuracy <- mean(predicted_classes == true_classes)
+print(paste("Accuracy on test set:", accuracy))
+
+# In ra một số dự đoán và giá trị thực tế
+results <- data.frame(True_Class = true_classes, Predicted_Class = predicted_classes)
+head(results)
+
+# (Tùy chọn) Hiển thị ma trận nhầm lẫn
+conf_matrix <- confusionMatrix(as.factor(predicted_classes), as.factor(true_classes))
+print(conf_matrix)
+```
+
+
+#Test XgBoost
+
+
+```{r}
+install.packages("xgboost")
+library(xgboost)
+
+# Tải mô hình từ file đã lưu
+model_xgboost <- xgb.load("sentiment_model.xgb")
+```
+
+
+```{r}
+# Đọc dữ liệu test từ file CSV
+data_test <- read.csv("test_data.csv")
+
+# Tách dữ liệu đầu vào (features) và nhãn (label)
+x_test <- as.matrix(sapply(data_test[, -which(names(data_test) == "label")], as.numeric))
+y_test <- as.numeric(as.factor(data_test$label)) - 1  # Chuyển đổi thành số nguyên bắt đầu từ 0
+
+# Kiểm tra kích thước dữ liệu test
+dim(x_test)
+length(y_test)
+
+```
+
+
+```{r}
+# Tạo DMatrix cho dữ liệu test
+dtest <- xgb.DMatrix(data = x_test)
+
+# Lấy số lớp từ dữ liệu test
+num_class <- length(unique(y_test))
+
+# Dự đoán xác suất cho từng lớp
+pred_prob <- predict(model_xgboost, x_test)
+
+# Chuyển đổi dự đoán thành ma trận với số cột tương ứng với số lớp
+pred_prob <- matrix(pred_prob, ncol = num_class, byrow = TRUE)
+
+
+# Lấy nhãn dự đoán (chọn lớp có xác suất cao nhất)
+y_pred <- max.col(pred_prob) - 1  # Trừ 1 để nhãn bắt đầu từ 0
+
+
+```
+
+
+
+```{r}
+library(caret)
+
+# Tạo ma trận nhầm lẫn (Confusion Matrix)
+conf_matrix <- confusionMatrix(as.factor(y_pred), as.factor(y_test))
+print(conf_matrix)
+
+# Tính toán độ chính xác (Accuracy)
+accuracy <- sum(y_pred == y_test) / length(y_test)
+cat("Accuracy:", accuracy, "\n")
+
+```
+
+
+
+```{r}
+# Hiển thị các chỉ số đánh giá khác như Precision, Recall, F1-score
+precision <- posPredValue(as.factor(y_pred), as.factor(y_test), positive = "1")
+recall <- sensitivity(as.factor(y_pred), as.factor(y_test), positive = "1")
+f1_score <- 2 * ((precision * recall) / (precision + recall))
+
+cat("Precision:", precision, "\n")
+cat("Recall:", recall, "\n")
+cat("F1 Score:", f1_score, "\n")
+
+```
+
+
+
+
+
