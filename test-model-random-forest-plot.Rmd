@@ -1,0 +1,198 @@
+---
+title: "test-random-forest"
+author: "hieuduong"
+date: "2024-11-20"
+output: html_document
+---
+
+
+# Khai báo thư viện
+
+```{r}
+library(text2vec)
+library(ranger)
+library(SnowballC)
+library(ggplot2)
+```
+
+
+#Load Model
+
+```{r}
+vocab <- readRDS("")
+vectorizer <- vocab_vectorizer(vocab)  # Tạo vectorizer từ vocab
+model <- readRDS("")
+```
+
+# Tiền xứ lí
+
+```{r}
+custom_stop_words <- c(
+    "a", "an", "the", "am", "is", "are", "was", "were", "be", "being", "been",
+    "i", "im", "me", "my", "mine", "myself",
+    "you", "your", "yours", "yourself",
+    "he", "him", "his", "himself",
+    "she", "her", "hers", "herself",
+    "it", "its", "itself",
+    "we", "us", "our", "ours", "ourselves",
+    "they", "them", "their", "theirs", "themselves",
+    "do", "does", "did",
+    "have", "has", "had",
+    "will", "would",
+    "can", "could",
+    "shall", "should", "feel", "ive",
+    "may", "might",
+    "must",
+    "in", "on", "at", "to",
+    "of", "from", "with",
+    "by", "for", "about",
+    "under", "over", "between",
+    "through", "during", "within",
+    "without", "throughout", "into",
+    "onto", "upon",
+    "and", "but", "or",
+    "nor", "yet", "so",
+    "because", "although",
+    "unless", "whereas",
+    "while", "if",
+    "just", "now", "then",
+    "here", "there", "where",
+    "how", "why", "when",
+    "again", "often",
+    "sometimes", "usually",
+    "this", "that", "these", "those",
+    "what", "which", "who", "whom",
+    "whose", "where",
+    "why", "how", "all", "any",
+    "both", "each", "few", "more",
+    "most", "other", "some", "such",
+    "own", "same", "than",
+    "too", "up", "down", "feel"
+)
+
+clean_text_for_prediction <- function(text) {
+  text <- tolower(text)
+  
+  words <- unlist(strsplit(text, "\\s+"))
+  words <- words[!words %in% custom_stop_words]
+  
+  words <- gsub("[[:punct:]]", "", words)
+  words <- wordStem(words, language = "en")
+  
+  cleaned_text <- paste(words, collapse = " ")
+  return(cleaned_text)
+}
+
+```
+
+
+```{r}
+predict_sentiment <- function(new_text, model, vectorizer) {
+  cleaned_text <- clean_text_for_prediction(new_text)
+  it_new <- itoken(cleaned_text, tokenizer = word_tokenizer)
+  dtm_new <- create_dtm(it_new, vectorizer)
+  
+  tfidf <- TfIdf$new()
+  dtm_tfidf_new <- tfidf$fit_transform(dtm_new)
+  
+  dtm_tfidf_new_df <- as.data.frame(as.matrix(dtm_tfidf_new))
+  
+  expected_features <- model$forest$independent.variable.names
+  
+  full_data <- as.data.frame(matrix(0, nrow = 1, ncol = length(expected_features)))
+  colnames(full_data) <- expected_features
+  
+  common_features <- intersect(names(dtm_tfidf_new_df), names(full_data))
+  full_data[common_features] <- dtm_tfidf_new_df[common_features]
+  
+  prediction <- predict(model, data = full_data, type = "response")
+  
+  return(prediction$predictions)
+}
+
+```
+
+
+```{r}
+plot_emotion_probabilities <- function(new_text, model, vectorizer) {
+  result <- predict_sentiment(new_text, model, vectorizer)
+  
+  emotions <- c("sadness", "joy", "love", "anger", "fear", "surprise")
+  
+  df <- data.frame(
+    emotion = emotions, 
+    probability = as.numeric(result)
+  )
+  
+  ggplot(df, aes(x = emotion, y = probability, fill = emotion)) +
+    geom_bar(stat = "identity") +
+    labs(
+      title = paste("Xác Suất Cảm Xúc Cho Văn Bản:", new_text),
+      x = "Cảm Xúc",
+      y = "Xác Suất"
+    ) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    scale_fill_brewer(palette = "Set3")
+}
+```
+
+
+```{r}
+analyze_emotions <- function(file_path, model, vectorizer) {
+  data <- read.csv(file_path, stringsAsFactors = FALSE)
+  
+  emotions <- c("sadness", "joy", "love", "anger", "fear", "surprise")
+  
+  emotion_counts <- rep(0, length(emotions))
+  names(emotion_counts) <- emotions
+  
+  for (text in data$text) { 
+    result <- predict_sentiment(text, model, vectorizer)
+    max_prob_index <- which.max(result)
+    predicted_emotion <- emotions[max_prob_index]
+    emotion_counts[predicted_emotion] <- emotion_counts[predicted_emotion] + 1
+  }
+  
+  df <- data.frame(
+    emotion = names(emotion_counts),
+    count = as.numeric(emotion_counts)
+  )
+  
+  ggplot(df, aes(x = emotion, y = count, fill = emotion)) +
+    geom_bar(stat = "identity") +
+    labs(
+      title = "Số Lượng Cảm Xúc Trong Tập Dữ Liệu",
+      x = "Cảm Xúc",
+      y = "Số Lượng"
+    ) +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    scale_fill_brewer(palette = "Set3")
+  return(list(
+    emotion_counts = emotion_counts,
+    plot = last_plot()
+  ))
+}
+```
+
+# Dùng model dự đoán 1 câu
+
+```{r}
+plot_emotion_probabilities("", model, vectorizer)
+```
+
+# Dùng model dự đoán 1 file csv
+
+```{r}
+result <- analyze_emotions("", model, vectorizer)
+print(result$emotion_counts)
+result$plot
+```
+
+
+
+
+
+
+
